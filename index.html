@@ -38,6 +38,8 @@
   #timeDisplay, #status { margin-top: 2px; font-size: 14px; color: var(--muted); }
   .hidden { display: none; }
 </style>
+<script src="https://cdn.jsdelivr.net/npm/mp4-muxer@5.1.3/build/mp4-muxer.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/webm-muxer@5.0.3/build/webm-muxer.js"></script>
 </head>
 <body>
 <div id="panel">
@@ -53,11 +55,29 @@
     </label>
     <div class="row"><button id="linkSet" type="button">リンクの映像を使う</button><button id="linkClear" type="button">解除</button></div>
     <div id="linkStatus" style="font-size:13px;color:var(--muted)"></div>
-    <label>リンク映像の拡大(映像に焼き込まれた字幕やロゴを円の外へ追い出せます)<input type="range" id="embedZoom" min="1" max="2" step="0.05" value="1" /></label>
     <div class="row">
       <button id="startButton" type="button">再生開始</button>
       <button id="fsBtn" type="button">⛶ 全画面</button>
       <button id="recBtn" type="button">⏺ 録画開始</button>
+    </div>
+    <div id="exportBox" style="margin-top:10px;padding-top:8px;border-top:1px solid #555">
+      <div style="font-size:14px;color:var(--muted)">⚡ 高速書き出し(再生せずに動画ファイルを作る)</div>
+      <div class="row">
+        <select id="expSize">
+          <option value="1280x720">1280×720(横)</option>
+          <option value="1920x1080">1920×1080(横)</option>
+          <option value="1080x1920">1080×1920(縦)</option>
+          <option value="1080x1080">1080×1080(正方形)</option>
+          <option value="screen">今の画面と同じ比率</option>
+        </select>
+        <select id="expFps"><option value="30">30fps</option><option value="60">60fps</option></select>
+      </div>
+      <div class="row" style="font-size:14px;color:var(--muted);margin-top:6px">
+        開始<input type="number" id="expStart" value="0" min="0" step="0.1" style="width:80px;font-size:16px" />秒
+        終了<input type="number" id="expEnd" min="0" step="0.1" placeholder="最後まで" style="width:90px;font-size:16px" />秒
+      </div>
+      <div class="row"><button id="expBtn" type="button">⚡ 高速書き出し</button></div>
+      <div id="expStatus" style="font-size:13px;color:var(--muted);margin-top:4px"></div>
     </div>
     <div id="status"></div>
 
@@ -116,7 +136,7 @@
   const volumeInput = $('volume'), muteBtn = $('muteBtn'), loopBtn = $('loopBtn');
   const fsBtn = $('fsBtn'), recBtn = $('recBtn'), fitRange = $('fitRange'), punchInput = $('punch'), layoutInput = $('layout');
   const linkInput = $('linkInput'), linkSet = $('linkSet'), linkClear = $('linkClear'), linkStatus = $('linkStatus');
-  const embedWrap = $('embedWrap'), embedFrame = $('embedFrame'), embedZoomInput = $('embedZoom');
+  const embedWrap = $('embedWrap'), embedFrame = $('embedFrame');
   const spinOn = $('spinOn'), spinSpeed = $('spinSpeed'), spinVal = $('spinVal'), barColorInput = $('barColor');
 
   const SHOW = 3000, FADE = 700;       // 進行リングの表示時間 / フェード時間(ms)
@@ -141,6 +161,7 @@
   let imageObj = null, barsInfo = [], hoveredBarIndex = -1, dpr = 1;
   let ring = { x: 0, y: 0, r: 0 }, ringDrag = false, ringAlpha = 0, lastTouch = -1e9;
   let recorder = null, chunks = [];
+  let currentFile = null, exporting = false, exportCancel = false;
 
   spinSpeed.addEventListener('input', () => {
     const v = parseInt(spinSpeed.value, 10);
@@ -183,12 +204,8 @@
     dpr = Math.min(window.devicePixelRatio || 1, 2);
     canvas.width = Math.round(window.innerWidth * dpr);
     canvas.height = Math.round(window.innerHeight * dpr);
-    // 見かけの大きさも innerWidth/innerHeight にそろえる(スマホで100vhがずれて円が縦長になるのを防ぐ)
-    canvas.style.width = window.innerWidth + 'px';
-    canvas.style.height = window.innerHeight + 'px';
   }
   window.addEventListener('resize', resizeCanvas);
-  window.addEventListener('orientationchange', resizeCanvas);
   resizeCanvas();
 
   // ---- 画像 ----
@@ -223,7 +240,7 @@
   }
   // ---- リンク(YouTube / ニコニコ動画)の映像を円の中に使う ----
   // 外部サイトの映像は取り込めないため、公式の埋め込みプレーヤーを円形に切り抜いて、キャンバスの後ろに置いている
-  let embed = null, embedR = 0, embedZ = 0, embedShown = false;
+  let embed = null, embedR = 0, embedShown = false;
   function parseLink(u) {
     let m = u.match(/(?:youtu\.be\/|youtube\.com\/(?:watch\?(?:[^#]*&)?v=|shorts\/|embed\/|live\/))([\w-]{11})/);
     if (m) return { type: 'yt', id: m[1] };
@@ -235,13 +252,12 @@
     if (!embed || !embedFrame.contentWindow) return;
     try {
       if (embed.type === 'yt') {
-        const post = (func, args) => embedFrame.contentWindow.postMessage(JSON.stringify({ event: 'command', func, args }), '*');
-        if (kind === 'nocc') { post('unloadModule', ['captions']); post('unloadModule', ['cc']); } // 字幕を消す
-        else post(kind === 'play' ? 'playVideo' : kind === 'pause' ? 'pauseVideo' : 'mute', '');
+        const func = kind === 'play' ? 'playVideo' : kind === 'pause' ? 'pauseVideo' : 'mute';
+        embedFrame.contentWindow.postMessage(JSON.stringify({ event: 'command', func, args: '' }), '*');
       } else {
         const send = (eventName, data) => embedFrame.contentWindow.postMessage({ playerId: '1', sourceConnectorType: 1, eventName, data }, 'https://embed.nicovideo.jp');
         if (kind === 'mute') { send('mute', { mute: true }); send('volumeChange', { volume: 0 }); }
-        else if (kind !== 'nocc') send(kind);
+        else send(kind);
       }
     } catch (e) {}
   }
@@ -254,11 +270,10 @@
     const ang = media.src && isFinite(media.duration) && media.duration && spinOn.checked
       ? (media.currentTime / media.duration) * Math.PI * 2 * parseFloat(spinSpeed.value) : 0;
     if (!embedShown) { embedWrap.style.display = 'block'; embedShown = true; }
-    const z = parseFloat(embedZoomInput.value) || 1;
-    if (embedR !== r || embedZ !== z) {
+    if (embedR !== r) {
       embedWrap.style.width = embedWrap.style.height = (r * 2) + 'px';
-      embedFrame.style.transform = 'translate(-50%, -50%) scale(' + ((r * 2) / 360) * z + ')';
-      embedR = r; embedZ = z;
+      embedFrame.style.transform = 'translate(-50%, -50%) scale(' + (r * 2) / 360 + ')';
+      embedR = r;
     }
     embedWrap.style.transform = 'translate(' + (w / 2 + offsetX - r) + 'px, ' + (h / 2 + offsetY - r) + 'px) rotate(' + ang + 'rad)';
   }
@@ -271,31 +286,12 @@
     const origin = /^https?:$/.test(location.protocol) ? '&origin=' + encodeURIComponent(location.origin) : '';
     embedFrame.src = info.type === 'yt'
       ? 'https://www.youtube.com/embed/' + info.id + '?autoplay=1&mute=1&controls=0&loop=1&playlist=' + info.id +
-        '&playsinline=1&modestbranding=1&rel=0&disablekb=1&fs=0&iv_load_policy=3&cc_load_policy=0&enablejsapi=1' + origin
+        '&playsinline=1&modestbranding=1&rel=0&disablekb=1&fs=0&iv_load_policy=3&enablejsapi=1' + origin
       : 'https://embed.nicovideo.jp/watch/' + info.id + '?jsapi=1&playerId=1&autoplay=1';
-    embedFrame.onload = () => {
-      try { embedFrame.contentWindow.postMessage(JSON.stringify({ event: 'listening', id: 1, channel: 'widget' }), '*'); } catch (e) {} // YouTubeからの状態通知を受け取る
-      [1200, 3000, 6000].forEach(ms => setTimeout(() => { embedCmd('mute'); embedCmd('nocc'); syncEmbed(); }, ms));
-    };
+    embedFrame.onload = () => [1200, 3000].forEach(ms => setTimeout(() => { embedCmd('mute'); syncEmbed(); }, ms));
     linkStatus.textContent = location.protocol === 'file:' && info.type === 'yt'
       ? '読み込み中…(このHTMLをファイルとして直接開いていると、YouTubeが表示されない(エラー153)ことがあります。その場合はWebサーバー上で開いてください)'
       : '読み込み中…(映像が出ない場合は、公開されている動画か、埋め込みが許可されているかを確認してください)';
-  });
-  // YouTubeからの通知(エラーの理由 / 再生開始)を画面に表示する
-  window.addEventListener('message', e => {
-    if (!embed || embed.type !== 'yt' || e.source !== embedFrame.contentWindow) return;
-    let d = e.data;
-    if (typeof d === 'string') { try { d = JSON.parse(d); } catch (err) { return; } }
-    if (!d) return;
-    if (d.event === 'onError') {
-      const c = d.info;
-      linkStatus.textContent = c === 153 ? 'エラー153: YouTubeに「どのページから開いたか」が伝わっていないため再生できません。このHTMLをファイルとして直接開いている場合に起きます(Webサーバー上で開くと解決します)'
-        : (c === 101 || c === 150) ? 'この動画は埋め込み再生が許可されていません(エラー' + c + ')。別の動画で試してください'
-        : c === 100 ? '動画が見つかりません(非公開、または削除されている可能性があります)'
-        : '再生できませんでした(エラー' + c + ')';
-    } else if (d.event === 'onStateChange' && d.info === 1) {
-      linkStatus.textContent = 'YouTube: 再生中';
-    }
   });
   linkClear.addEventListener('click', () => {
     embed = null; embedFrame.src = 'about:blank'; linkStatus.textContent = '';
@@ -322,6 +318,7 @@
   // ---- 読み込み ----
   async function loadMedia(file) {
     initAudio();
+    currentFile = file;
     audioCtx.resume();
     const token = ++loadToken;
     fixedBins = 0; rangeFixed = false; liveMax = 32;
@@ -483,6 +480,183 @@
     recBtn.textContent = '⏹ 録画停止(保存)';
   });
 
+  // ---- 高速書き出し(再生せず、1フレームずつ計算して動画にする) ----
+  const expBtn = $('expBtn'), expStatus = $('expStatus'), expSize = $('expSize'), expFps = $('expFps'), expStart = $('expStart'), expEnd = $('expEnd');
+  const sleep = ms => new Promise(r => setTimeout(r, ms));
+  function seekEl(el, t) { // 動画をその時刻に合わせて、映像が用意できるまで待つ
+    return new Promise(res => {
+      if (!el || !isFinite(el.duration) || !el.duration) return res();
+      t = Math.min(Math.max(0, t), Math.max(0, el.duration - 0.001));
+      if (Math.abs(el.currentTime - t) < 0.0005 && el.readyState >= 2) return res();
+      const done = () => { clearTimeout(tm); el.removeEventListener('seeked', done); res(); };
+      const tm = setTimeout(done, 3000);
+      el.addEventListener('seeked', done);
+      el.currentTime = t;
+    });
+  }
+  // AnalyserNode(fftSize 512 / 平滑化0.8 / -100〜-30dB)と同じ考え方で、指定時刻の周波数データ(0〜255)を計算する
+  function makeSpectrum(chs, sr, fps) {
+    const FN = 512, half = 256, len = chs[0].length;
+    const win = new Float32Array(FN);
+    for (let i = 0; i < FN; i++) win[i] = 0.42 - 0.5 * Math.cos(2 * Math.PI * i / FN) + 0.08 * Math.cos(4 * Math.PI * i / FN);
+    const re = new Float32Array(FN), im = new Float32Array(FN), sm = new Float32Array(half);
+    const tau = Math.pow(0.8, 60 / fps); // 画面表示(約60回/秒)と同じ滑らかさになるよう調整
+    return (t, out) => {
+      const end = Math.floor(t * sr);
+      for (let i = 0; i < FN; i++) {
+        const idx = end - FN + i;
+        let s = 0;
+        if (idx >= 0 && idx < len) { for (let c = 0; c < chs.length; c++) s += chs[c][idx]; s /= chs.length; }
+        re[i] = s * win[i]; im[i] = 0;
+      }
+      fft(re, im);
+      for (let k = 0; k < half; k++) {
+        sm[k] = tau * sm[k] + (1 - tau) * Math.hypot(re[k], im[k]) / FN;
+        const v = Math.floor(255 * (20 * Math.log10(sm[k] + 1e-12) + 100) / 70);
+        out[k] = v < 0 ? 0 : v > 255 ? 255 : v;
+      }
+    };
+  }
+  async function runExport() {
+    if (exporting) { exportCancel = true; expStatus.textContent = '中止しています…'; return; }
+    if (!currentFile || !media.src || !isFinite(media.duration)) { alert('先に音楽・動画ファイルを読み込んでください(リンクのみの場合は使えません)'); return; }
+    if (!(window.VideoEncoder && window.AudioEncoder && window.VideoFrame && window.AudioData)) { alert('このブラウザは高速書き出しに対応していません(最新の Chrome / Edge をお使いください)'); return; }
+    if (!(window.Mp4Muxer && window.WebMMuxer)) { alert('書き出し用ライブラリを読み込めませんでした。ネットに接続して再読み込みしてください'); return; }
+
+    const even = n => Math.max(2, Math.round(n / 2) * 2);
+    const liveMin = Math.min(window.innerWidth, window.innerHeight);
+    let W, H;
+    if (expSize.value === 'screen') {
+      const k = 1280 / Math.max(window.innerWidth, window.innerHeight);
+      W = even(window.innerWidth * k); H = even(window.innerHeight * k);
+    } else { [W, H] = expSize.value.split('x').map(Number); }
+    const s = Math.min(W, H) / liveMin; // 画面で見ている見た目と同じ比率になるよう拡大する倍率
+    const fps = parseInt(expFps.value, 10);
+    const dur = media.duration;
+    const start = Math.max(0, parseFloat(expStart.value) || 0);
+    const end = expEnd.value === '' ? dur : Math.min(dur, parseFloat(expEnd.value));
+    if (!(end > start + 0.1)) { alert('開始と終了の秒数を確認してください'); return; }
+    const total = Math.ceil((end - start) * fps);
+    const vbr = Math.min(2e7, Math.max(2e6, Math.round(W * H * fps * 0.1)));
+
+    exporting = true; exportCancel = false;
+    media.pause();
+    const savedT = media.currentTime;
+    const saved = { rangeFixed, fixedBins, avgSmooth, lastPx };
+    expBtn.textContent = '⏹ 中止';
+    let ac = null, venc = null, aenc = null;
+    try {
+      expStatus.textContent = '音声を読み込み中…';
+      ac = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 48000 });
+      const buf = await ac.decodeAudioData(await currentFile.arrayBuffer());
+      const sr = buf.sampleRate, nch = Math.min(2, buf.numberOfChannels);
+      const chs = []; for (let c = 0; c < nch; c++) chs.push(buf.getChannelData(c));
+
+      // 周波数の範囲(円の一周に合わせる設定)を、画面表示と同じになるようそろえる
+      if (rangeFixed) fixedBins = Math.max(16, Math.min(256, Math.round(fixedBins * audioCtx.sampleRate / sr)));
+      else {
+        expStatus.textContent = '周波数の範囲を調べています…';
+        const sp = makeSpectrum(chs, sr, fps); let top = 0;
+        for (let i = 0; i < total; i++) {
+          sp(start + i / fps, dataArray);
+          for (let k = dataArray.length - 1; k >= top; k--) if (dataArray[k] > LIVE_TH) { top = k + 1; break; }
+          if (i % 500 === 499) await sleep(0);
+        }
+        fixedBins = Math.max(32, top); rangeFixed = true;
+      }
+
+      // 使えるエンコーダーを選ぶ(MP4 優先、だめなら WebM)
+      let fmt = null, vcodec = null;
+      const vcfg = (codec, extra) => Object.assign({ codec, width: W, height: H, bitrate: vbr, framerate: fps }, extra || {});
+      const aacOk = (await AudioEncoder.isConfigSupported({ codec: 'mp4a.40.2', sampleRate: sr, numberOfChannels: nch, bitrate: 192000 })).supported;
+      if (aacOk) for (const c of ['avc1.640034', 'avc1.64002A', 'avc1.640028', 'avc1.4D0028']) {
+        if ((await VideoEncoder.isConfigSupported(vcfg(c, { avc: { format: 'avc' } }))).supported) { vcodec = c; fmt = 'mp4'; break; }
+      }
+      if (!fmt) {
+        const opusOk = (await AudioEncoder.isConfigSupported({ codec: 'opus', sampleRate: sr, numberOfChannels: nch, bitrate: 128000 })).supported;
+        if (opusOk) for (const c of ['vp09.00.50.08', 'vp09.00.40.08', 'vp8']) {
+          if ((await VideoEncoder.isConfigSupported(vcfg(c))).supported) { vcodec = c; fmt = 'webm'; break; }
+        }
+      }
+      if (!fmt) throw new Error('このブラウザで使える動画エンコーダーが見つかりませんでした');
+
+      const muxer = fmt === 'mp4'
+        ? new Mp4Muxer.Muxer({ target: new Mp4Muxer.ArrayBufferTarget(), video: { codec: 'avc', width: W, height: H }, audio: { codec: 'aac', numberOfChannels: nch, sampleRate: sr }, fastStart: 'in-memory' })
+        : new WebMMuxer.Muxer({ target: new WebMMuxer.ArrayBufferTarget(), video: { codec: vcodec === 'vp8' ? 'V_VP8' : 'V_VP9', width: W, height: H, frameRate: fps }, audio: { codec: 'A_OPUS', numberOfChannels: nch, sampleRate: sr } });
+      let encErr = null;
+      venc = new VideoEncoder({ output: (c, m) => muxer.addVideoChunk(c, m), error: e => { encErr = e; } });
+      venc.configure(vcfg(vcodec, fmt === 'mp4' ? { avc: { format: 'avc' } } : null));
+      aenc = new AudioEncoder({ output: (c, m) => muxer.addAudioChunk(c, m), error: e => { encErr = e; } });
+      aenc.configure({ codec: fmt === 'mp4' ? 'mp4a.40.2' : 'opus', sampleRate: sr, numberOfChannels: nch, bitrate: fmt === 'mp4' ? 192000 : 128000 });
+
+      // ---- 映像:1フレームずつ描画してエンコード ----
+      const oc = document.createElement('canvas'); oc.width = W; oc.height = H;
+      const octx = oc.getContext('2d');
+      avgSmooth = null; lastPx = null; frameN = 0;
+      const pv = !embed && !imageObj && picVideo && picVideo.videoWidth ? picVideo : null; // 円の中に使う動画
+      const mv = !embed && !imageObj && !pv && media.videoWidth ? media : null;            // 読み込んだ動画の映像
+      const spec = makeSpectrum(chs, sr, fps);
+      for (let j = 6; j > 0; j--) spec(Math.max(0, start - j / fps), dataArray); // 平滑化の助走
+      const t0 = performance.now();
+      for (let i = 0; i < total; i++) {
+        if (exportCancel) throw new Error('中止しました');
+        if (encErr) throw encErr;
+        const t = start + i / fps;
+        spec(t, dataArray);
+        if (pv) await seekEl(pv, t % pv.duration);
+        if (mv) await seekEl(mv, t);
+        octx.setTransform(1, 0, 0, 1, 0, 0);
+        octx.fillStyle = '#000'; octx.fillRect(0, 0, W, H);
+        renderFrame(octx, t, W / s, H / s, s, true);
+        const frame = new VideoFrame(oc, { timestamp: Math.round(i * 1e6 / fps), duration: Math.round(1e6 / fps) });
+        venc.encode(frame, { keyFrame: i % (fps * 2) === 0 });
+        frame.close();
+        while (venc.encodeQueueSize > 6) await sleep(1);
+        if (i % 10 === 0) {
+          const el = (performance.now() - t0) / 1000, done = i / fps;
+          expStatus.textContent = '映像を作成中 ' + Math.round(i / total * 100) + '%' + (el > 1 ? '(約' + (done / el).toFixed(1) + '倍速・残り約' + Math.ceil((total - i) / fps / Math.max(0.01, done / el)) + '秒)' : '');
+          await sleep(0);
+        }
+      }
+      await venc.flush();
+
+      // ---- 音声:そのままエンコード ----
+      expStatus.textContent = '音声を書き込み中…';
+      const a0 = Math.floor(start * sr), a1 = Math.min(buf.length, Math.floor(end * sr)), CH = 4096;
+      for (let pos = a0, n = 0; pos < a1; pos += CH, n++) {
+        if (exportCancel) throw new Error('中止しました');
+        const cnt = Math.min(CH, a1 - pos), data = new Float32Array(cnt * nch);
+        for (let c = 0; c < nch; c++) data.set(chs[c].subarray(pos, pos + cnt), c * cnt);
+        const ad = new AudioData({ format: 'f32-planar', sampleRate: sr, numberOfFrames: cnt, numberOfChannels: nch, timestamp: Math.round((pos - a0) / sr * 1e6), data });
+        aenc.encode(ad); ad.close();
+        while (aenc.encodeQueueSize > 20) await sleep(1);
+        if (n % 50 === 0) await sleep(0);
+      }
+      await aenc.flush();
+      if (encErr) throw encErr;
+
+      muxer.finalize();
+      const blob = new Blob([muxer.target.buffer], { type: fmt === 'mp4' ? 'video/mp4' : 'video/webm' });
+      const a = document.createElement('a');
+      a.href = URL.createObjectURL(blob);
+      a.download = 'visualizer.' + (fmt === 'mp4' ? 'mp4' : 'webm');
+      a.click();
+      setTimeout(() => URL.revokeObjectURL(a.href), 10000);
+      const sec = (performance.now() - t0) / 1000;
+      expStatus.textContent = '完了:' + a.download + '(' + (end - start).toFixed(1) + '秒の動画を ' + sec.toFixed(1) + '秒で作成)' + (embed ? ' ※リンクの映像は含まれません' : '');
+    } catch (err) {
+      expStatus.textContent = '書き出しできませんでした(' + (err && err.message || err) + ')';
+    } finally {
+      for (const e of [venc, aenc]) { try { if (e && e.state !== 'closed') e.close(); } catch (x) {} }
+      if (ac) ac.close();
+      ({ rangeFixed, fixedBins, avgSmooth, lastPx } = saved);
+      exporting = false; exportCancel = false;
+      expBtn.textContent = '⚡ 高速書き出し';
+      try { media.currentTime = savedT; } catch (e) {}
+    }
+  }
+  expBtn.addEventListener('click', runExport);
+
   // ---- 進行リング(触ると表示、数秒で消える) ----
   let dragFrac = 0, btnDown = false, downX = 0, downY = 0;
   let tapDown = null, lastTapT = 0, lastTapX = 0, lastTapY = 0, tapTimer = null, skipFx = null;
@@ -584,25 +758,27 @@
   function draw() {
     requestAnimationFrame(draw);
     placeEmbed();
+    if (exporting) return; // 書き出し中は画面の描画を止める
     ctx.setTransform(1, 0, 0, 1, 0, 0);
     ctx.clearRect(0, 0, canvas.width, canvas.height);
     const dur = media.duration;
     if (!analyser || !media.src || !isFinite(dur) || !dur) return;
-    ctx.scale(dpr, dpr);
-
     analyser.getByteFrequencyData(dataArray);
-
     const tNow = isUserSeeking ? parseFloat(seekBar.value) : media.currentTime;
     if (!isUserSeeking) { seekBar.value = tNow; updateTimeDisplay(tNow); }
+    renderFrame(ctx, tNow, window.innerWidth, window.innerHeight, dpr, false);
+  }
+  // 1フレーム分の描画(画面表示と書き出しで共通)。dataArray に周波数データが入っている前提
+  function renderFrame(ctx, tNow, w, h, dpr, off) {
+    const dur = media.duration;
+    ctx.scale(dpr, dpr);
     const p = Math.min(tNow / dur, 1);
-
-    const w = window.innerWidth, h = window.innerHeight;
     const centerX = w / 2 + offsetX, centerY = h / 2 + offsetY;
     const radius = Math.min(w, h) / 6;
     ring = { x: centerX, y: centerY, r: radius - 10, br: Math.max(22, (radius - 10) * 0.3) };
 
     const age = performance.now() - lastTouch;
-    ringAlpha = age < SHOW ? 1 : Math.max(0, 1 - (age - SHOW) / FADE);
+    ringAlpha = off ? 0 : age < SHOW ? 1 : Math.max(0, 1 - (age - SHOW) / FADE);
 
     frameN++;
     const spinAngle = spinOn.checked ? (tNow / dur) * Math.PI * 2 * parseFloat(spinSpeed.value) : 0;
@@ -683,7 +859,7 @@
       const angle = line ? -Math.PI / 2 : i * step;
       const bx = line ? w * 0.04 + (i + 0.5) * spacing : centerX + Math.cos(angle) * (radius - inner);
       const by = line ? baseY : centerY + Math.sin(angle) * (radius - inner);
-      const hv = i === hoveredBarIndex;
+      const hv = !off && i === hoveredBarIndex;
       let fill;
       if (mode === 'image' && px) {
         // 回転後の画像の、このバーの真下あたり(縁)の色。暗い所でも見えるよう明るさをそろえる
@@ -749,7 +925,7 @@
       ctx.restore();
     }
     // 連打で「+10 → +20 → +30」と秒数が積み上がっていく表示(新しい数字がポンと弾む)
-    if (skipFx) {
+    if (skipFx && !off) {
       const el = performance.now() - skipFx.t;
       if (el > SKIP_MS) skipFx = null;
       else {
