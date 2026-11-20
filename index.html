@@ -20,7 +20,7 @@
     background: var(--panel); padding: 10px 14px; border-radius: 8px; }
   #panelHead { display: flex; align-items: center; justify-content: space-between; }
   h2 { font-size: 16px; margin: 0; }
-  canvas { display: block; position: fixed; top: 0; left: 0; width: 100vw; height: 100vh; cursor: crosshair; touch-action: none; z-index: 1; }
+  canvas { display: block; position: fixed; inset: 0; width: 100%; height: 100%; cursor: crosshair; touch-action: none; z-index: 1; }
   #embedWrap { position: fixed; top: 0; left: 0; z-index: 0; display: none; border-radius: 50%; overflow: hidden;
     clip-path: circle(50% at 50% 50%); pointer-events: none; transform-origin: center; background: #000; }
   #embedFrame { position: absolute; left: 50%; top: 50%; width: 640px; height: 360px; border: 0; pointer-events: none; transform-origin: center; }
@@ -200,12 +200,18 @@
     $('togglePanel').textContent = body.classList.contains('hidden') ? '開く' : 'たたむ';
   });
 
+  let viewW = window.innerWidth, viewH = window.innerHeight;
   function resizeCanvas() {
     dpr = Math.min(window.devicePixelRatio || 1, 2);
-    canvas.width = Math.round(window.innerWidth * dpr);
-    canvas.height = Math.round(window.innerHeight * dpr);
+    const r = canvas.getBoundingClientRect(); // 実際に表示されている大きさを基準にする(円がつぶれないように)
+    viewW = r.width || window.innerWidth; viewH = r.height || window.innerHeight;
+    canvas.width = Math.max(1, Math.round(viewW * dpr));
+    canvas.height = Math.max(1, Math.round(viewH * dpr));
   }
   window.addEventListener('resize', resizeCanvas);
+  if (window.ResizeObserver) new ResizeObserver(resizeCanvas).observe(canvas);
+  if (window.visualViewport) visualViewport.addEventListener('resize', resizeCanvas);
+  document.addEventListener('fullscreenchange', resizeCanvas);
   resizeCanvas();
 
   // ---- 画像 ----
@@ -266,7 +272,7 @@
   media.addEventListener('pause', syncEmbed);
   function placeEmbed() {
     if (!embed) { if (embedShown) { embedWrap.style.display = 'none'; embedShown = false; } return; }
-    const w = window.innerWidth, h = window.innerHeight, r = Math.min(w, h) / 6;
+    const w = viewW, h = viewH, r = Math.min(w, h) / 6;
     const ang = media.src && isFinite(media.duration) && media.duration && spinOn.checked
       ? (media.currentTime / media.duration) * Math.PI * 2 * parseFloat(spinSpeed.value) : 0;
     if (!embedShown) { embedWrap.style.display = 'block'; embedShown = true; }
@@ -483,6 +489,7 @@
   // ---- 高速書き出し(再生せず、1フレームずつ計算して動画にする) ----
   const expBtn = $('expBtn'), expStatus = $('expStatus'), expSize = $('expSize'), expFps = $('expFps'), expStart = $('expStart'), expEnd = $('expEnd');
   const sleep = ms => new Promise(r => setTimeout(r, ms));
+  const tick = () => new Promise(r => { const c = new MessageChannel(); c.port1.onmessage = () => r(); c.port2.postMessage(0); });
   function seekEl(el, t) { // 動画をその時刻に合わせて、映像が用意できるまで待つ
     return new Promise(res => {
       if (!el || !isFinite(el.duration) || !el.duration) return res();
@@ -524,11 +531,11 @@
     if (!(window.Mp4Muxer && window.WebMMuxer)) { alert('書き出し用ライブラリを読み込めませんでした。ネットに接続して再読み込みしてください'); return; }
 
     const even = n => Math.max(2, Math.round(n / 2) * 2);
-    const liveMin = Math.min(window.innerWidth, window.innerHeight);
+    const liveMin = Math.min(viewW, viewH);
     let W, H;
     if (expSize.value === 'screen') {
-      const k = 1280 / Math.max(window.innerWidth, window.innerHeight);
-      W = even(window.innerWidth * k); H = even(window.innerHeight * k);
+      const k = 1280 / Math.max(viewW, viewH);
+      W = even(viewW * k); H = even(viewH * k);
     } else { [W, H] = expSize.value.split('x').map(Number); }
     const s = Math.min(W, H) / liveMin; // 画面で見ている見た目と同じ比率になるよう拡大する倍率
     const fps = parseInt(expFps.value, 10);
@@ -565,38 +572,62 @@
         fixedBins = Math.max(32, top); rangeFixed = true;
       }
 
-      // 使えるエンコーダーを選ぶ(MP4 優先、だめなら WebM)
+      // 使えるエンコーダーを選ぶ(MP4/AAC 優先、だめなら WebM/Opus)。音声は1秒ぶん実際に試し打ちして確認する
       let fmt = null, vcodec = null;
       const vcfg = (codec, extra) => Object.assign({ codec, width: W, height: H, bitrate: vbr, framerate: fps }, extra || {});
-      const aacOk = (await AudioEncoder.isConfigSupported({ codec: 'mp4a.40.2', sampleRate: sr, numberOfChannels: nch, bitrate: 192000 })).supported;
-      if (aacOk) for (const c of ['avc1.640034', 'avc1.64002A', 'avc1.640028', 'avc1.4D0028']) {
+      const acfg = (codec, br) => Object.assign({ codec, sampleRate: sr, numberOfChannels: nch, bitrate: br }, codec === 'mp4a.40.2' ? { aac: { format: 'aac' } } : {});
+      const audioOk = async (codec, br) => {
+        try {
+          if (!(await AudioEncoder.isConfigSupported(acfg(codec, br))).supported) return false;
+          let n = 0, bad = false;
+          const e = new AudioEncoder({ output: () => n++, error: () => { bad = true; } });
+          e.configure(acfg(codec, br));
+          const ad = new AudioData({ format: 'f32-planar', sampleRate: sr, numberOfFrames: sr, numberOfChannels: nch, timestamp: 0, data: new Float32Array(sr * nch) });
+          e.encode(ad); ad.close();
+          await e.flush(); e.close();
+          return !bad && n > 0;
+        } catch (x) { return false; }
+      };
+      if (await audioOk('mp4a.40.2', 192000)) for (const c of ['avc1.640034', 'avc1.64002A', 'avc1.640028', 'avc1.4D0028']) {
         if ((await VideoEncoder.isConfigSupported(vcfg(c, { avc: { format: 'avc' } }))).supported) { vcodec = c; fmt = 'mp4'; break; }
       }
-      if (!fmt) {
-        const opusOk = (await AudioEncoder.isConfigSupported({ codec: 'opus', sampleRate: sr, numberOfChannels: nch, bitrate: 128000 })).supported;
-        if (opusOk) for (const c of ['vp09.00.50.08', 'vp09.00.40.08', 'vp8']) {
-          if ((await VideoEncoder.isConfigSupported(vcfg(c))).supported) { vcodec = c; fmt = 'webm'; break; }
-        }
+      if (!fmt && await audioOk('opus', 128000)) for (const c of ['vp09.00.50.08', 'vp09.00.40.08', 'vp8']) {
+        if ((await VideoEncoder.isConfigSupported(vcfg(c))).supported) { vcodec = c; fmt = 'webm'; break; }
       }
-      if (!fmt) throw new Error('このブラウザで使える動画エンコーダーが見つかりませんでした');
+      if (!fmt) throw new Error('このブラウザでは、映像と音声を両方書き出せるエンコーダーが見つかりませんでした');
 
+      let encErr = null, audioChunks = 0;
+      const guard = fn => (...a) => { try { fn(...a); } catch (e) { encErr = e; } };
       const muxer = fmt === 'mp4'
-        ? new Mp4Muxer.Muxer({ target: new Mp4Muxer.ArrayBufferTarget(), video: { codec: 'avc', width: W, height: H }, audio: { codec: 'aac', numberOfChannels: nch, sampleRate: sr }, fastStart: 'in-memory' })
-        : new WebMMuxer.Muxer({ target: new WebMMuxer.ArrayBufferTarget(), video: { codec: vcodec === 'vp8' ? 'V_VP8' : 'V_VP9', width: W, height: H, frameRate: fps }, audio: { codec: 'A_OPUS', numberOfChannels: nch, sampleRate: sr } });
-      let encErr = null;
-      venc = new VideoEncoder({ output: (c, m) => muxer.addVideoChunk(c, m), error: e => { encErr = e; } });
+        ? new Mp4Muxer.Muxer({ target: new Mp4Muxer.ArrayBufferTarget(), video: { codec: 'avc', width: W, height: H }, audio: { codec: 'aac', numberOfChannels: nch, sampleRate: sr }, fastStart: 'in-memory', firstTimestampBehavior: 'offset' })
+        : new WebMMuxer.Muxer({ target: new WebMMuxer.ArrayBufferTarget(), video: { codec: vcodec === 'vp8' ? 'V_VP8' : 'V_VP9', width: W, height: H, frameRate: fps }, audio: { codec: 'A_OPUS', numberOfChannels: nch, sampleRate: sr }, firstTimestampBehavior: 'offset' });
+      venc = new VideoEncoder({ output: guard((c, m) => muxer.addVideoChunk(c, m)), error: e => { encErr = e; } });
       venc.configure(vcfg(vcodec, fmt === 'mp4' ? { avc: { format: 'avc' } } : null));
-      aenc = new AudioEncoder({ output: (c, m) => muxer.addAudioChunk(c, m), error: e => { encErr = e; } });
-      aenc.configure({ codec: fmt === 'mp4' ? 'mp4a.40.2' : 'opus', sampleRate: sr, numberOfChannels: nch, bitrate: fmt === 'mp4' ? 192000 : 128000 });
+      aenc = new AudioEncoder({ output: guard((c, m) => { muxer.addAudioChunk(c, m); audioChunks++; }), error: e => { encErr = e; } });
+      aenc.configure(acfg(fmt === 'mp4' ? 'mp4a.40.2' : 'opus', fmt === 'mp4' ? 192000 : 128000));
+
+      // 音声:映像のフレームを作るたびに、その時刻までの音声も一緒に入れる
+      const a0 = Math.floor(start * sr), a1 = Math.min(buf.length, Math.floor(end * sr)), CH = 4096;
+      let apos = a0;
+      const pushAudio = async upTo => {
+        const lim = Math.min(a1, Math.floor(upTo * sr));
+        while (apos < lim) {
+          const cnt = Math.min(CH, lim - apos), data = new Float32Array(cnt * nch);
+          for (let c = 0; c < nch; c++) data.set(chs[c].subarray(apos, apos + cnt), c * cnt);
+          const ad = new AudioData({ format: 'f32-planar', sampleRate: sr, numberOfFrames: cnt, numberOfChannels: nch, timestamp: Math.round((apos - a0) / sr * 1e6), data });
+          aenc.encode(ad); ad.close(); apos += cnt;
+          while (aenc.encodeQueueSize > 20) await tick();
+        }
+      };
 
       // ---- 映像:1フレームずつ描画してエンコード ----
       const oc = document.createElement('canvas'); oc.width = W; oc.height = H;
       const octx = oc.getContext('2d');
       avgSmooth = null; lastPx = null; frameN = 0;
-      const pv = !embed && !imageObj && picVideo && picVideo.videoWidth ? picVideo : null; // 円の中に使う動画
-      const mv = !embed && !imageObj && !pv && media.videoWidth ? media : null;            // 読み込んだ動画の映像
+      const pv = !embed && !imageObj && picVideo && picVideo.videoWidth ? picVideo : null;
+      const mv = !embed && !imageObj && !pv && media.videoWidth ? media : null;
       const spec = makeSpectrum(chs, sr, fps);
-      for (let j = 6; j > 0; j--) spec(Math.max(0, start - j / fps), dataArray); // 平滑化の助走
+      for (let j = 6; j > 0; j--) spec(Math.max(0, start - j / fps), dataArray);
       const t0 = performance.now();
       for (let i = 0; i < total; i++) {
         if (exportCancel) throw new Error('中止しました');
@@ -611,29 +642,19 @@
         const frame = new VideoFrame(oc, { timestamp: Math.round(i * 1e6 / fps), duration: Math.round(1e6 / fps) });
         venc.encode(frame, { keyFrame: i % (fps * 2) === 0 });
         frame.close();
-        while (venc.encodeQueueSize > 6) await sleep(1);
+        await pushAudio(start + (i + 1) / fps);
+        while (venc.encodeQueueSize > 6) await tick();
         if (i % 10 === 0) {
           const el = (performance.now() - t0) / 1000, done = i / fps;
-          expStatus.textContent = '映像を作成中 ' + Math.round(i / total * 100) + '%' + (el > 1 ? '(約' + (done / el).toFixed(1) + '倍速・残り約' + Math.ceil((total - i) / fps / Math.max(0.01, done / el)) + '秒)' : '');
-          await sleep(0);
+          expStatus.textContent = '映像と音声を作成中 ' + Math.round(i / total * 100) + '%' + (el > 1 ? '(約' + (done / el).toFixed(1) + '倍速・残り約' + Math.ceil((total - i) / fps / Math.max(0.01, done / el)) + '秒)' : '');
+          await tick();
         }
       }
+      await pushAudio(end + 1);
       await venc.flush();
-
-      // ---- 音声:そのままエンコード ----
-      expStatus.textContent = '音声を書き込み中…';
-      const a0 = Math.floor(start * sr), a1 = Math.min(buf.length, Math.floor(end * sr)), CH = 4096;
-      for (let pos = a0, n = 0; pos < a1; pos += CH, n++) {
-        if (exportCancel) throw new Error('中止しました');
-        const cnt = Math.min(CH, a1 - pos), data = new Float32Array(cnt * nch);
-        for (let c = 0; c < nch; c++) data.set(chs[c].subarray(pos, pos + cnt), c * cnt);
-        const ad = new AudioData({ format: 'f32-planar', sampleRate: sr, numberOfFrames: cnt, numberOfChannels: nch, timestamp: Math.round((pos - a0) / sr * 1e6), data });
-        aenc.encode(ad); ad.close();
-        while (aenc.encodeQueueSize > 20) await sleep(1);
-        if (n % 50 === 0) await sleep(0);
-      }
       await aenc.flush();
       if (encErr) throw encErr;
+      if (!audioChunks) throw new Error('音声のエンコードに失敗しました');
 
       muxer.finalize();
       const blob = new Blob([muxer.target.buffer], { type: fmt === 'mp4' ? 'video/mp4' : 'video/webm' });
@@ -766,7 +787,7 @@
     analyser.getByteFrequencyData(dataArray);
     const tNow = isUserSeeking ? parseFloat(seekBar.value) : media.currentTime;
     if (!isUserSeeking) { seekBar.value = tNow; updateTimeDisplay(tNow); }
-    renderFrame(ctx, tNow, window.innerWidth, window.innerHeight, dpr, false);
+    renderFrame(ctx, tNow, viewW, viewH, canvas.width / viewW, false);
   }
   // 1フレーム分の描画(画面表示と書き出しで共通)。dataArray に周波数データが入っている前提
   function renderFrame(ctx, tNow, w, h, dpr, off) {
