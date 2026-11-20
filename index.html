@@ -53,6 +53,7 @@
     </label>
     <div class="row"><button id="linkSet" type="button">リンクの映像を使う</button><button id="linkClear" type="button">解除</button></div>
     <div id="linkStatus" style="font-size:13px;color:var(--muted)"></div>
+    <label>リンク映像の拡大(映像に焼き込まれた字幕やロゴを円の外へ追い出せます)<input type="range" id="embedZoom" min="1" max="2" step="0.05" value="1" /></label>
     <div class="row">
       <button id="startButton" type="button">再生開始</button>
       <button id="fsBtn" type="button">⛶ 全画面</button>
@@ -115,7 +116,7 @@
   const volumeInput = $('volume'), muteBtn = $('muteBtn'), loopBtn = $('loopBtn');
   const fsBtn = $('fsBtn'), recBtn = $('recBtn'), fitRange = $('fitRange'), punchInput = $('punch'), layoutInput = $('layout');
   const linkInput = $('linkInput'), linkSet = $('linkSet'), linkClear = $('linkClear'), linkStatus = $('linkStatus');
-  const embedWrap = $('embedWrap'), embedFrame = $('embedFrame');
+  const embedWrap = $('embedWrap'), embedFrame = $('embedFrame'), embedZoomInput = $('embedZoom');
   const spinOn = $('spinOn'), spinSpeed = $('spinSpeed'), spinVal = $('spinVal'), barColorInput = $('barColor');
 
   const SHOW = 3000, FADE = 700;       // 進行リングの表示時間 / フェード時間(ms)
@@ -182,8 +183,12 @@
     dpr = Math.min(window.devicePixelRatio || 1, 2);
     canvas.width = Math.round(window.innerWidth * dpr);
     canvas.height = Math.round(window.innerHeight * dpr);
+    // 見かけの大きさも innerWidth/innerHeight にそろえる(スマホで100vhがずれて円が縦長になるのを防ぐ)
+    canvas.style.width = window.innerWidth + 'px';
+    canvas.style.height = window.innerHeight + 'px';
   }
   window.addEventListener('resize', resizeCanvas);
+  window.addEventListener('orientationchange', resizeCanvas);
   resizeCanvas();
 
   // ---- 画像 ----
@@ -218,7 +223,7 @@
   }
   // ---- リンク(YouTube / ニコニコ動画)の映像を円の中に使う ----
   // 外部サイトの映像は取り込めないため、公式の埋め込みプレーヤーを円形に切り抜いて、キャンバスの後ろに置いている
-  let embed = null, embedR = 0, embedShown = false;
+  let embed = null, embedR = 0, embedZ = 0, embedShown = false;
   function parseLink(u) {
     let m = u.match(/(?:youtu\.be\/|youtube\.com\/(?:watch\?(?:[^#]*&)?v=|shorts\/|embed\/|live\/))([\w-]{11})/);
     if (m) return { type: 'yt', id: m[1] };
@@ -230,12 +235,13 @@
     if (!embed || !embedFrame.contentWindow) return;
     try {
       if (embed.type === 'yt') {
-        const func = kind === 'play' ? 'playVideo' : kind === 'pause' ? 'pauseVideo' : 'mute';
-        embedFrame.contentWindow.postMessage(JSON.stringify({ event: 'command', func, args: '' }), '*');
+        const post = (func, args) => embedFrame.contentWindow.postMessage(JSON.stringify({ event: 'command', func, args }), '*');
+        if (kind === 'nocc') { post('unloadModule', ['captions']); post('unloadModule', ['cc']); } // 字幕を消す
+        else post(kind === 'play' ? 'playVideo' : kind === 'pause' ? 'pauseVideo' : 'mute', '');
       } else {
         const send = (eventName, data) => embedFrame.contentWindow.postMessage({ playerId: '1', sourceConnectorType: 1, eventName, data }, 'https://embed.nicovideo.jp');
         if (kind === 'mute') { send('mute', { mute: true }); send('volumeChange', { volume: 0 }); }
-        else send(kind);
+        else if (kind !== 'nocc') send(kind);
       }
     } catch (e) {}
   }
@@ -248,10 +254,11 @@
     const ang = media.src && isFinite(media.duration) && media.duration && spinOn.checked
       ? (media.currentTime / media.duration) * Math.PI * 2 * parseFloat(spinSpeed.value) : 0;
     if (!embedShown) { embedWrap.style.display = 'block'; embedShown = true; }
-    if (embedR !== r) {
+    const z = parseFloat(embedZoomInput.value) || 1;
+    if (embedR !== r || embedZ !== z) {
       embedWrap.style.width = embedWrap.style.height = (r * 2) + 'px';
-      embedFrame.style.transform = 'translate(-50%, -50%) scale(' + (r * 2) / 360 + ')';
-      embedR = r;
+      embedFrame.style.transform = 'translate(-50%, -50%) scale(' + ((r * 2) / 360) * z + ')';
+      embedR = r; embedZ = z;
     }
     embedWrap.style.transform = 'translate(' + (w / 2 + offsetX - r) + 'px, ' + (h / 2 + offsetY - r) + 'px) rotate(' + ang + 'rad)';
   }
@@ -264,12 +271,31 @@
     const origin = /^https?:$/.test(location.protocol) ? '&origin=' + encodeURIComponent(location.origin) : '';
     embedFrame.src = info.type === 'yt'
       ? 'https://www.youtube.com/embed/' + info.id + '?autoplay=1&mute=1&controls=0&loop=1&playlist=' + info.id +
-        '&playsinline=1&modestbranding=1&rel=0&disablekb=1&fs=0&iv_load_policy=3&enablejsapi=1' + origin
+        '&playsinline=1&modestbranding=1&rel=0&disablekb=1&fs=0&iv_load_policy=3&cc_load_policy=0&enablejsapi=1' + origin
       : 'https://embed.nicovideo.jp/watch/' + info.id + '?jsapi=1&playerId=1&autoplay=1';
-    embedFrame.onload = () => [1200, 3000].forEach(ms => setTimeout(() => { embedCmd('mute'); syncEmbed(); }, ms));
+    embedFrame.onload = () => {
+      try { embedFrame.contentWindow.postMessage(JSON.stringify({ event: 'listening', id: 1, channel: 'widget' }), '*'); } catch (e) {} // YouTubeからの状態通知を受け取る
+      [1200, 3000, 6000].forEach(ms => setTimeout(() => { embedCmd('mute'); embedCmd('nocc'); syncEmbed(); }, ms));
+    };
     linkStatus.textContent = location.protocol === 'file:' && info.type === 'yt'
       ? '読み込み中…(このHTMLをファイルとして直接開いていると、YouTubeが表示されない(エラー153)ことがあります。その場合はWebサーバー上で開いてください)'
       : '読み込み中…(映像が出ない場合は、公開されている動画か、埋め込みが許可されているかを確認してください)';
+  });
+  // YouTubeからの通知(エラーの理由 / 再生開始)を画面に表示する
+  window.addEventListener('message', e => {
+    if (!embed || embed.type !== 'yt' || e.source !== embedFrame.contentWindow) return;
+    let d = e.data;
+    if (typeof d === 'string') { try { d = JSON.parse(d); } catch (err) { return; } }
+    if (!d) return;
+    if (d.event === 'onError') {
+      const c = d.info;
+      linkStatus.textContent = c === 153 ? 'エラー153: YouTubeに「どのページから開いたか」が伝わっていないため再生できません。このHTMLをファイルとして直接開いている場合に起きます(Webサーバー上で開くと解決します)'
+        : (c === 101 || c === 150) ? 'この動画は埋め込み再生が許可されていません(エラー' + c + ')。別の動画で試してください'
+        : c === 100 ? '動画が見つかりません(非公開、または削除されている可能性があります)'
+        : '再生できませんでした(エラー' + c + ')';
+    } else if (d.event === 'onStateChange' && d.info === 1) {
+      linkStatus.textContent = 'YouTube: 再生中';
+    }
   });
   linkClear.addEventListener('click', () => {
     embed = null; embedFrame.src = 'about:blank'; linkStatus.textContent = '';
